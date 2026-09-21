@@ -24,6 +24,12 @@ class TradingConfig:
     COINSWITCH_SECRET_KEY: str = os.getenv("COINSWITCH_SECRET_KEY", "")
     COINSWITCH_PROXY_URL: str = os.getenv("COINSWITCH_PROXY_URL", "")
     
+    # --- Telegram & Web Dashboard ---
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "titan_apex_2026")
+    WEB_PORT: int = int(os.getenv("PORT", "8000"))
+    
     # --- Target Instruments & Timeframes ---
     PRIMARY_SYMBOL: str = "ETHUSDT"        # 1-Hour candles
     SECONDARY_SYMBOL: str = "BTCUSDT"      # 4-Hour candles

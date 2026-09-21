@@ -38,7 +38,7 @@ class CoinSwitchFuturesClient:
         
         # Base URLs: Direct CoinSwitch Pro or Cloudflare Worker Proxy
         self.direct_base_url = "https://coinswitch.co"
-        self.base_url = self.direct_base_url
+        self.base_url = self.proxy_url.rstrip("/") if self.proxy_url else self.direct_base_url
         
         # Initialize Ed25519 Keys
         self._priv_key: Optional[ed25519.Ed25519PrivateKey] = None
