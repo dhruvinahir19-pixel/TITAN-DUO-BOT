@@ -16,6 +16,7 @@ from core.signal_generator import SignalGenerator, SignalResult
 from core.trade_state import BotState, ActiveTrade, TradeStatus, ExitReason
 from core.strategy_engine import StrategyEngine
 from core.db_manager import DatabaseManager
+from core.exchange_client import CoinSwitchFuturesClient, SmartOrderChaser
 
 __all__ = [
     "calc_ema_numba",
@@ -33,5 +34,7 @@ __all__ = [
     "TradeStatus",
     "ExitReason",
     "StrategyEngine",
-    "DatabaseManager"
+    "DatabaseManager",
+    "CoinSwitchFuturesClient",
+    "SmartOrderChaser"
 ]

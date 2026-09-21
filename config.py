@@ -20,6 +20,9 @@ class TradingConfig:
     
     # --- Database & Infrastructure ---
     DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+    COINSWITCH_API_KEY: str = os.getenv("COINSWITCH_API_KEY", "")
+    COINSWITCH_SECRET_KEY: str = os.getenv("COINSWITCH_SECRET_KEY", "")
+    COINSWITCH_PROXY_URL: str = os.getenv("COINSWITCH_PROXY_URL", "")
     
     # --- Target Instruments & Timeframes ---
     PRIMARY_SYMBOL: str = "ETHUSDT"        # 1-Hour candles

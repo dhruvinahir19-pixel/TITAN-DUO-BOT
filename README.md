@@ -2,7 +2,8 @@
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: Proprietary](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE)
-[![Verification: 100% Passed](https://img.shields.io/badge/Tests-22%20Passed%20(100%25)-brightgreen.svg)](tests/)
+[![Verification: 100% Passed](https://img.shields.io/badge/Tests-28%20Passed%20(100%25)-brightgreen.svg)](tests/)
+[![Exchange: CoinSwitch Pro](https://img.shields.io/badge/Exchange-CoinSwitch%20Pro%20Futures-blue.svg)](core/exchange_client.py)
 [![Database: Neon Serverless](https://img.shields.io/badge/Database-Neon%20Zero--Burn-purple.svg)](core/db_manager.py)
 [![45-Month Growth](https://img.shields.io/badge/Capital%20Growth-53.6x%20Net-gold.svg)](TITAN_DUO_STRATEGY_BLUEPRINT.md)
 
