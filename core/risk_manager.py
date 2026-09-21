@@ -2,10 +2,12 @@
 TITAN DUO v4.0 APEX - RISK MANAGEMENT & SIZING MODULE
 =====================================================
 Calculates exact mathematical position sizing, dynamic streak scaling,
-hard leverage caps, stop loss, take profit, and risk-free pyramiding levels.
+hard leverage caps, stop loss, take profit, risk-free pyramiding levels,
+and exchange-enforced decimal precision formatting.
 """
 
-from typing import Tuple, Dict, Any
+import math
+from typing import Tuple, Dict, Any, Optional
 from config import CONFIG, TradingConfig
 
 class RiskManager:
@@ -56,17 +58,51 @@ class RiskManager:
             "unit_risk": float(abs(entry_price - stop_loss))
         }
 
+    def format_order_quantity(self, symbol: str, raw_units: float) -> float:
+        """
+        Exchange Precision Invariant:
+        CoinSwitch Pro Futures rules:
+        - BTCUSDT: quantity_precision = 3 (step size = 0.001)
+        - ETHUSDT: quantity_precision = 2 (step size = 0.01)
+        Always uses math.floor to prevent exceeding margin or account risk.
+        """
+        prec = 3 if "BTC" in symbol.upper() else 2
+        factor = 10 ** prec
+        floored = math.floor(raw_units * factor) / factor
+        return float(floored)
+
+    def format_price(self, symbol: str, price: float) -> float:
+        """
+        Formats order prices to 2 decimal places (standard USD perpetual tick size).
+        """
+        return round(float(price), 2)
+
+    def validate_order_constraints(self, symbol: str, units: float, price: float) -> Tuple[bool, str]:
+        """
+        Validates minimum contract size and minimum exchange notional value ($5.00 USD).
+        """
+        min_qty = 0.001 if "BTC" in symbol.upper() else 0.01
+        if units < min_qty:
+            return False, f"Units ({units}) below exchange minimum ({min_qty}) for {symbol}"
+            
+        notional = units * price
+        if notional < 5.00:
+            return False, f"Order notional (${notional:,.2f}) below exchange minimum of $5.00 USD"
+            
+        return True, "VALID"
+
     def calculate_position_size(
         self,
         wallet_equity: float,
         entry_price: float,
         stop_loss: float,
         consec_losses: int,
-        consec_wins: int
+        consec_wins: int,
+        leverage_ceiling: Optional[float] = None
     ) -> Dict[str, Any]:
         """
         Calculates unit quantity ensuring risk budget is respected and
-        effective leverage NEVER exceeds the 5.0x hard ceiling.
+        effective leverage NEVER exceeds the leverage ceiling.
         """
         if wallet_equity < self.config.MIN_WALLET_BALANCE_USDT:
             return {
@@ -84,20 +120,21 @@ class RiskManager:
             
         effective_risk_pct = self.calculate_effective_risk_pct(consec_losses, consec_wins)
         risk_capital = wallet_equity * effective_risk_pct
-        units = risk_capital / unit_risk
-        notional_value = units * entry_price
+        raw_units = risk_capital / unit_risk
+        notional_value = raw_units * entry_price
         
-        # Hard 5.0x Effective Leverage Ceiling
-        max_allowable_notional = wallet_equity * self.config.MAX_EFFECTIVE_LEVERAGE
+        # Effective Leverage Ceiling check (e.g. 5x base, or user specified ceiling)
+        effective_cap = leverage_ceiling if leverage_ceiling else self.config.MAX_EFFECTIVE_LEVERAGE
+        max_allowable_notional = wallet_equity * effective_cap
         leverage_capped = False
         
         if notional_value > max_allowable_notional:
-            units = max_allowable_notional / entry_price
+            raw_units = max_allowable_notional / entry_price
             notional_value = max_allowable_notional
             leverage_capped = True
             
         return {
-            "units": float(units),
+            "units": float(raw_units),
             "notional_value": float(notional_value),
             "effective_risk_pct": float(effective_risk_pct),
             "risk_amount_usdt": float(risk_capital),

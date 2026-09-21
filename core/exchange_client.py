@@ -7,10 +7,13 @@ Features:
 - NTP Clock Drift Auto-Correction (< 5,000ms drift window)
 - 10-Second Smart Limit Order Chaser (Dynamic Re-quoting)
 - Strict 0.35% Slippage Ceiling Guard (Anti-Wick Chase Protection)
+- Dynamic Leverage Control (1x - 25x)
 - Native Exchange Hardware Stop-Loss Order Management
+- Emergency Market Order Fail-Safe (Zero Unprotected Exposure)
 """
 
 import time
+import math
 import logging
 import urllib.parse
 from typing import Optional, Dict, Any, List, Tuple
@@ -60,7 +63,6 @@ class CoinSwitchFuturesClient:
         try:
             secret_bytes = bytes.fromhex(self.secret_key_hex)
             self._priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(secret_bytes)
-            # Derive the 32-byte raw public key in hex
             pub_bytes = self._priv_key.public_key().public_bytes(
                 encoding=serialization.Encoding.Raw,
                 format=serialization.PublicFormat.Raw
@@ -106,7 +108,6 @@ class CoinSwitchFuturesClient:
         method = method.upper()
         if params:
             sep = "&" if "?" in path else "?"
-            # Clean None values
             clean_params = {k: v for k, v in params.items() if v is not None}
             path = path + sep + urllib.parse.urlencode(clean_params)
         decoded_path = urllib.parse.unquote_plus(path)
@@ -156,7 +157,6 @@ class CoinSwitchFuturesClient:
             )
             return resp
         except requests.RequestException as e:
-            # Fallback to direct URL if proxy experiences connectivity issue
             if self.base_url != self.direct_base_url:
                 logger.warning(f"Proxy request failed: {e}. Falling back to direct CoinSwitch API...")
                 url = f"{self.direct_base_url}{decoded_path}"
@@ -182,11 +182,37 @@ class CoinSwitchFuturesClient:
             raise RuntimeError(f"Wallet balance query failed ({resp.status_code}): {resp.text}")
         return resp.json().get("data", {})
 
+    def get_instrument_info(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Fetches trading rules, lot sizes, tick precision, and leverage range from CoinSwitch.
+        """
+        resp = self._send_request("GET", "/trade/api/v2/futures/instrument_info", params={"exchange": "EXCHANGE_2"})
+        if resp.status_code != 200:
+            raise RuntimeError(f"Get instrument info failed ({resp.status_code}): {resp.text}")
+        data = resp.json().get("data", {})
+        if symbol:
+            return data.get(symbol.upper(), {})
+        return data
+
+    def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
+        """
+        Updates exchange leverage for a futures symbol.
+        """
+        body = {
+            "exchange": "EXCHANGE_2",
+            "symbol": symbol.upper(),
+            "leverage": int(leverage)
+        }
+        resp = self._send_request("POST", "/trade/api/v2/futures/leverage", json_body=body)
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(f"Set leverage failed ({resp.status_code}): {resp.text}")
+        return resp.json().get("data", {})
+
     def get_order_book(self, symbol: str) -> Dict[str, Any]:
         """
         Fetches live orderbook (Bids and Asks) for the specified perpetual symbol.
         """
-        params = {"symbol": symbol, "exchange": "EXCHANGE_2"}
+        params = {"symbol": symbol.upper(), "exchange": "EXCHANGE_2"}
         resp = self._send_request("GET", "/trade/api/v2/futures/order_book", params=params)
         if resp.status_code != 200:
             raise RuntimeError(f"Order book query failed ({resp.status_code}): {resp.text}")
@@ -196,7 +222,7 @@ class CoinSwitchFuturesClient:
         """
         Fetches active perpetual futures positions.
         """
-        params = {"symbol": symbol, "exchange": "EXCHANGE_2"} if symbol else {"exchange": "EXCHANGE_2"}
+        params = {"symbol": symbol.upper(), "exchange": "EXCHANGE_2"} if symbol else {"exchange": "EXCHANGE_2"}
         resp = self._send_request("GET", "/trade/api/v2/futures/positions", params=params)
         if resp.status_code != 200:
             raise RuntimeError(f"Positions query failed ({resp.status_code}): {resp.text}")
@@ -208,7 +234,7 @@ class CoinSwitchFuturesClient:
         """
         params = {"open": "true", "exchange": "EXCHANGE_2"}
         if symbol:
-            params["symbol"] = symbol
+            params["symbol"] = symbol.upper()
         resp = self._send_request("GET", "/trade/api/v2/futures/orders", params=params)
         if resp.status_code != 200:
             raise RuntimeError(f"Open orders query failed ({resp.status_code}): {resp.text}")
@@ -241,7 +267,7 @@ class CoinSwitchFuturesClient:
         """
         body = {
             "exchange": "EXCHANGE_2",
-            "symbol": symbol,
+            "symbol": symbol.upper(),
             "side": side.upper(),
             "order_type": "LIMIT",
             "price": float(price),
@@ -253,6 +279,30 @@ class CoinSwitchFuturesClient:
         resp = self._send_request("POST", "/trade/api/v2/futures/order", json_body=body)
         if resp.status_code not in (200, 201):
             raise RuntimeError(f"Place limit order failed ({resp.status_code}): {resp.text}")
+        return resp.json().get("data", {})
+
+    def place_market_order(
+        self,
+        symbol: str,
+        side: str,          # "BUY" or "SELL"
+        quantity: float,
+        reduce_only: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Submits an immediate Market order to CoinSwitch Pro matching engine.
+        Essential for Emergency Abort Fail-Safe.
+        """
+        body = {
+            "exchange": "EXCHANGE_2",
+            "symbol": symbol.upper(),
+            "side": side.upper(),
+            "order_type": "MARKET",
+            "quantity": float(quantity),
+            "reduce_only": reduce_only
+        }
+        resp = self._send_request("POST", "/trade/api/v2/futures/order", json_body=body)
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(f"Place market order failed ({resp.status_code}): {resp.text}")
         return resp.json().get("data", {})
 
     def place_stop_market_order(
@@ -268,7 +318,7 @@ class CoinSwitchFuturesClient:
         """
         body = {
             "exchange": "EXCHANGE_2",
-            "symbol": symbol,
+            "symbol": symbol.upper(),
             "side": side.upper(),
             "order_type": "STOP_MARKET",
             "quantity": 0,                      # 0 quantity = full position close on trigger
@@ -296,8 +346,8 @@ class CoinSwitchFuturesClient:
         """
         body = {"exchange": "EXCHANGE_2"}
         if symbol:
-            body["symbol"] = symbol
-        resp = self._send_request("POST", "/trade/api/v2/futures/cancel-all", json_body=body)
+            body["symbol"] = symbol.upper()
+        resp = self._send_request("POST", "/trade/api/v2/futures/cancel_all", json_body=body)
         if resp.status_code != 200:
             raise RuntimeError(f"Cancel all orders failed ({resp.status_code}): {resp.text}")
         return resp.json().get("data", {})

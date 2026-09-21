@@ -26,6 +26,7 @@ class ExitReason(str, Enum):
     OPPOSING_SIGNAL = "OPPOSING_SIGNAL"
     MANUAL_PANIC = "MANUAL_PANIC"
     ABORTED_CHASE = "ABORTED_CHASE"
+    EMERGENCY_SL_FAIL = "EMERGENCY_SL_FAIL"
 
 @dataclass
 class ActiveTrade:
@@ -76,6 +77,7 @@ class BotState:
     last_loss_timestamp: Optional[str] = None
     active_trade: Optional[ActiveTrade] = None
     is_paused: bool = False
+    leverage_ceiling: int = 20
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -85,7 +87,8 @@ class BotState:
             "last_loss_bar": self.last_loss_bar,
             "last_loss_timestamp": self.last_loss_timestamp,
             "active_trade": self.active_trade.to_dict() if self.active_trade else None,
-            "is_paused": self.is_paused
+            "is_paused": self.is_paused,
+            "leverage_ceiling": self.leverage_ceiling
         }
 
     @classmethod
@@ -99,5 +102,6 @@ class BotState:
             last_loss_bar=int(data.get("last_loss_bar", -9999)),
             last_loss_timestamp=data.get("last_loss_timestamp"),
             active_trade=active_trade,
-            is_paused=bool(data.get("is_paused", False))
+            is_paused=bool(data.get("is_paused", False)),
+            leverage_ceiling=int(data.get("leverage_ceiling", 20))
         )

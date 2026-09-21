@@ -228,11 +228,12 @@ class TelegramNotifier:
 
     def _handle_user_command(self, command_text: str):
         """
-        Dispatches incoming user command.
+        Dispatches incoming user command with full argument string.
         """
-        cmd = command_text.split()[0].lower()
+        command_clean = command_text.strip()
+        cmd = command_clean.split()[0].lower()
         if self._command_handler_callback:
-            reply = self._command_handler_callback(cmd)
+            reply = self._command_handler_callback(command_clean)
             self.send_message(reply)
         else:
             if cmd in ("/start", "/help"):
@@ -241,6 +242,7 @@ class TelegramNotifier:
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"📊 `/status` — Live portfolio balance & active trade\n"
                     f"🎯 `/levels` — View active Stop Loss & Take Profit\n"
+                    f"⚙️ `/setleverage <5-25>` — Update exchange leverage ceiling\n"
                     f"⏸️ `/pause` — Temporarily stop taking new trades\n"
                     f"▶️ `/resume` — Resume autonomous trading\n"
                     f"🚨 `/panic` — Emergency market-close & cancel all\n"

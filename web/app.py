@@ -3,7 +3,7 @@ TITAN DUO v4.0 APEX - FASTAPI WEB DASHBOARD & KEEP-ALIVE SERVER
 ===============================================================
 Institutional, high-frequency, dark-glassmorphism quant monitoring dashboard
 engineered for DD (Dhruvin Dangar). Fully mobile-responsive, self-contained SVG
-charts, live candle countdown, and real-time WebSocket/polling telemetry.
+charts, live candle countdown, dynamic leverage controls, and real-time telemetry.
 """
 
 import time
@@ -41,6 +41,7 @@ current_bot_state: Optional[BotState] = None
 panic_callback = None
 pause_callback = None
 resume_callback = None
+set_leverage_callback = None
 
 def get_uptime_str() -> str:
     elapsed = int(time.time() - START_TIME)
@@ -55,6 +56,7 @@ def keep_alive_ping():
     equity = current_bot_state.wallet_equity if current_bot_state else 100.0
     status_str = "ACTIVE" if (current_bot_state and current_bot_state.active_trade) else "IDLE"
     paused_str = "PAUSED" if (current_bot_state and current_bot_state.is_paused) else "RUNNING"
+    lev = current_bot_state.leverage_ceiling if current_bot_state else 20
     
     return {
         "status": "healthy",
@@ -62,6 +64,7 @@ def keep_alive_ping():
         "trade_state": status_str,
         "wallet_equity_usd": round(equity, 2),
         "wallet_equity_inr": round(equity * 85.50, 0),
+        "leverage_ceiling": lev,
         "uptime": get_uptime_str(),
         "timestamp": int(time.time())
     }
@@ -96,6 +99,10 @@ def get_closed_trades(limit: int = 50):
 class ControlAction(BaseModel):
     password: str
 
+class LeverageAction(BaseModel):
+    leverage: int
+    password: str
+
 @app.post("/api/panic")
 def trigger_panic(action: ControlAction):
     if action.password != CONFIG.ADMIN_PASSWORD:
@@ -123,11 +130,23 @@ def trigger_resume(action: ControlAction):
         return {"success": True, "message": "Bot resumed successfully."}
     return {"success": False}
 
+@app.post("/api/set_leverage")
+def trigger_set_leverage(action: LeverageAction):
+    if action.password != CONFIG.ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not (1 <= action.leverage <= 25):
+        raise HTTPException(status_code=400, detail="Leverage must be between 1x and 25x.")
+    if set_leverage_callback:
+        res = set_leverage_callback(action.leverage)
+        return {"success": True, "message": res}
+    return {"success": False, "message": "Leverage callback not configured."}
+
 @app.get("/", response_class=HTMLResponse)
 def serve_dashboard():
     equity = current_bot_state.wallet_equity if current_bot_state else 100.0
     equity_inr = equity * 85.50
     trade = current_bot_state.active_trade if current_bot_state else None
+    lev = current_bot_state.leverage_ceiling if current_bot_state else 20
     
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -264,6 +283,32 @@ def serve_dashboard():
             100% {{ transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }}
         }}
 
+        /* Button Controls */
+        .btn-action {{
+            padding: 8px 14px;
+            border-radius: 10px;
+            font-size: 12px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            border: 1px solid transparent;
+        }}
+        .btn-leverage {{
+            background: rgba(245, 158, 11, 0.15);
+            color: var(--gold);
+            border-color: rgba(245, 158, 11, 0.3);
+        }}
+        .btn-leverage:hover {{ background: var(--gold); color: #000; }}
+        .btn-panic {{
+            background: rgba(244, 63, 94, 0.15);
+            color: var(--loss);
+            border-color: rgba(244, 63, 94, 0.3);
+        }}
+        .btn-panic:hover {{ background: var(--loss); color: white; }}
+
         /* KPI Bento Grid */
         .bento-grid {{
             display: grid;
@@ -333,7 +378,6 @@ def serve_dashboard():
             border: 1px solid var(--border-subtle);
         }}
         
-        /* Interactive Step Progress for In-Trade Position */
         .progress-track {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
@@ -401,7 +445,6 @@ def serve_dashboard():
         .health-info h4 {{ font-size: 13px; font-weight: 600; }}
         .health-info p {{ font-size: 11px; color: var(--text-muted); }}
 
-        /* Mobile Action Bar */
         .mobile-footer {{
             display: flex;
             justify-content: space-between;
@@ -413,17 +456,6 @@ def serve_dashboard():
             font-size: 12px;
             text-align: center;
         }}
-        .btn-panic {{
-            background: rgba(244, 63, 94, 0.15);
-            color: var(--loss);
-            border: 1px solid rgba(244, 63, 94, 0.3);
-            padding: 8px 16px;
-            border-radius: 8px;
-            font-weight: 700;
-            cursor: pointer;
-            transition: all 0.2s;
-        }}
-        .btn-panic:hover {{ background: var(--loss); color: white; }}
     </style>
 </head>
 <body>
@@ -447,7 +479,12 @@ def serve_dashboard():
             <span class="badge badge-paper" id="mode-badge">
                 PAPER TRADING (₹0 RISK)
             </span>
-            <button class="btn-panic" onclick="promptPanic()">EMERGENCY PANIC</button>
+            <button class="btn-action btn-leverage" onclick="promptLeverage()">
+                ⚡ LEVERAGE: <span id="current-leverage">{lev}x</span>
+            </button>
+            <button class="btn-action btn-panic" onclick="promptPanic()">
+                🚨 PANIC
+            </button>
         </div>
     </header>
 
@@ -524,7 +561,7 @@ def serve_dashboard():
          "<p style='color: var(--text-muted); font-size: 14px; padding: 12px 0;'>No active trades. Capital is 100% liquid in USDT. The bot monitors ETHUSDT (1h) and BTCUSDT (4h) at minute 30 IST (XX:30:02 IST) for 48h Donchian Breakouts.</p>"}
     </section>
 
-    <!-- Institutional Equity Growth Chart (High-Precision Embedded SVG) -->
+    <!-- Institutional Equity Growth Chart -->
     <section class="chart-card">
         <div class="chart-header">
             <div class="chart-title">
@@ -547,19 +584,14 @@ def serve_dashboard():
                         <stop offset="100%" stop-color="#10B981"/>
                     </linearGradient>
                 </defs>
-                <!-- Grid Lines -->
                 <line x1="0" y1="40" x2="1000" y2="40" stroke="rgba(255,255,255,0.05)" stroke-dasharray="4"/>
                 <line x1="0" y1="90" x2="1000" y2="90" stroke="rgba(255,255,255,0.05)" stroke-dasharray="4"/>
                 <line x1="0" y1="140" x2="1000" y2="140" stroke="rgba(255,255,255,0.05)" stroke-dasharray="4"/>
                 <line x1="0" y1="190" x2="1000" y2="190" stroke="rgba(255,255,255,0.05)" stroke-dasharray="4"/>
 
-                <!-- Area Fill -->
                 <path d="M 0,200 L 0,195 Q 120,185 240,165 T 480,125 T 720,70 T 960,25 L 1000,20 L 1000,200 Z" fill="url(#curveGradient)"/>
-                
-                <!-- Stroke Line -->
                 <path d="M 0,195 Q 120,185 240,165 T 480,125 T 720,70 T 960,25 L 1000,20" fill="none" stroke="url(#lineGradient)" stroke-width="3" stroke-linecap="round"/>
 
-                <!-- Milestone Points -->
                 <circle cx="0" cy="195" r="4" fill="#818CF8"/>
                 <circle cx="240" cy="165" r="4" fill="#818CF8"/>
                 <circle cx="480" cy="125" r="4" fill="#6366F1"/>
@@ -642,12 +674,10 @@ def serve_dashboard():
 
     <!-- Interactive Client Script -->
     <script>
-        // Update Live Countdown to minute 30 of current hour
         function updateCandleTimer() {{
             const now = new Date();
             const min = now.getUTCMinutes();
             const sec = now.getUTCSeconds();
-            // In UTC, hourly candles close at :00 (which is :30 in IST)
             let remMin = 59 - min;
             let remSec = 60 - sec;
             if (remSec === 60) {{ remSec = 0; remMin += 1; }}
@@ -659,10 +689,8 @@ def serve_dashboard():
         setInterval(updateCandleTimer, 1000);
         updateCandleTimer();
 
-        // Auto-refresh Dashboard Data from /api/status and /api/trades
         async function fetchDashboardData() {{
             try {{
-                // 1. Fetch Status
                 const statusRes = await fetch('/api/status');
                 const statusData = await statusRes.json();
                 if (statusData && statusData.state) {{
@@ -673,9 +701,12 @@ def serve_dashboard():
                     const lossStreak = statusData.state.consecutive_losses || 0;
                     const winStreak = statusData.state.consecutive_wins || 0;
                     document.getElementById('streak-info').innerHTML = `Streak: ${{lossStreak}} Losses / ${{winStreak}} Wins | Chop Filter: <span style="color: var(--profit); font-weight:700;">NORMAL</span>`;
+
+                    const lev = statusData.state.leverage_ceiling || 20;
+                    const levEl = document.getElementById('current-leverage');
+                    if (levEl) levEl.textContent = `${{lev}}x`;
                 }}
 
-                // 2. Fetch Closed Trades
                 const tradesRes = await fetch('/api/trades');
                 const trades = await tradesRes.json();
                 if (Array.isArray(trades) && trades.length > 0) {{
@@ -705,6 +736,27 @@ def serve_dashboard():
 
         setInterval(fetchDashboardData, 8000);
         fetchDashboardData();
+
+        function promptLeverage() {{
+            const levStr = prompt("⚡ ENTER NEW LEVERAGE (5, 10, 15, 20, 25):");
+            if (!levStr) return;
+            const lev = parseInt(levStr);
+            if (isNaN(lev) || lev < 1 || lev > 25) {{
+                alert("Please enter a valid leverage between 1 and 25.");
+                return;
+            }}
+            const pwd = prompt("Enter Admin Password to confirm leverage change:");
+            if (pwd) {{
+                fetch('/api/set_leverage', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ leverage: lev, password: pwd }})
+                }}).then(res => res.json()).then(data => {{
+                    alert(data.message || "Leverage updated!");
+                    fetchDashboardData();
+                }}).catch(err => alert("Error setting leverage: " + err));
+            }}
+        }}
 
         function promptPanic() {{
             const pwd = prompt("⚠️ ENTER ADMIN PASSWORD TO EXECUTE EMERGENCY PANIC KILL-SWITCH:");

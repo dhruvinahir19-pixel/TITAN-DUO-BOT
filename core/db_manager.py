@@ -74,6 +74,7 @@ class DatabaseManager:
     def init_tables(self):
         """
         Creates optimized schema for bot_state, trades, and audit_logs.
+        Performs safe auto-migrations.
         """
         schema_sql = """
         -- Table 1: Bot State (Always exactly 1 row)
@@ -86,8 +87,12 @@ class DatabaseManager:
             last_loss_timestamp TIMESTAMPTZ,
             active_trade JSONB,
             is_paused BOOLEAN NOT NULL DEFAULT FALSE,
+            leverage_ceiling INTEGER NOT NULL DEFAULT 20,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+
+        -- Safe Migration: Ensure leverage_ceiling column exists if table was created previously
+        ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS leverage_ceiling INTEGER NOT NULL DEFAULT 20;
 
         -- Table 2: Closed Trades History
         CREATE TABLE IF NOT EXISTS trades (
@@ -119,8 +124,8 @@ class DatabaseManager:
         );
 
         -- Ensure initial bot_state row exists
-        INSERT INTO bot_state (id, wallet_equity, consecutive_losses, consecutive_wins, last_loss_bar, is_paused)
-        VALUES (1, 100.0, 0, 0, -9999, FALSE)
+        INSERT INTO bot_state (id, wallet_equity, consecutive_losses, consecutive_wins, last_loss_bar, is_paused, leverage_ceiling)
+        VALUES (1, 100.0, 0, 0, -9999, FALSE, 20)
         ON CONFLICT (id) DO NOTHING;
         """
         with self.get_connection() as conn:
@@ -135,7 +140,7 @@ class DatabaseManager:
         """
         query = """
         SELECT wallet_equity, consecutive_losses, consecutive_wins,
-               last_loss_bar, last_loss_timestamp, active_trade, is_paused
+               last_loss_bar, last_loss_timestamp, active_trade, is_paused, leverage_ceiling
         FROM bot_state
         WHERE id = 1;
         """
@@ -145,9 +150,8 @@ class DatabaseManager:
                 row = cur.fetchone()
                 
         if not row:
-            # Self-healing: initialize state
             self.init_tables()
-            return BotState(wallet_equity=100.0)
+            return BotState(wallet_equity=100.0, leverage_ceiling=20)
 
         active_trade = None
         if row['active_trade']:
@@ -160,7 +164,8 @@ class DatabaseManager:
             last_loss_bar=int(row['last_loss_bar']),
             last_loss_timestamp=str(row['last_loss_timestamp']) if row['last_loss_timestamp'] else None,
             active_trade=active_trade,
-            is_paused=bool(row['is_paused'])
+            is_paused=bool(row['is_paused']),
+            leverage_ceiling=int(row.get('leverage_ceiling', 20))
         )
 
     def save_bot_state(self, state: BotState) -> bool:
@@ -170,9 +175,9 @@ class DatabaseManager:
         query = """
         INSERT INTO bot_state (
             id, wallet_equity, consecutive_losses, consecutive_wins,
-            last_loss_bar, last_loss_timestamp, active_trade, is_paused, updated_at
+            last_loss_bar, last_loss_timestamp, active_trade, is_paused, leverage_ceiling, updated_at
         ) VALUES (
-            1, %s, %s, %s, %s, %s, %s, %s, NOW()
+            1, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
         )
         ON CONFLICT (id) DO UPDATE SET
             wallet_equity = EXCLUDED.wallet_equity,
@@ -182,6 +187,7 @@ class DatabaseManager:
             last_loss_timestamp = EXCLUDED.last_loss_timestamp,
             active_trade = EXCLUDED.active_trade,
             is_paused = EXCLUDED.is_paused,
+            leverage_ceiling = EXCLUDED.leverage_ceiling,
             updated_at = NOW();
         """
         active_trade_json = json.dumps(state.active_trade.to_dict()) if state.active_trade else None
@@ -195,7 +201,8 @@ class DatabaseManager:
                     state.last_loss_bar,
                     state.last_loss_timestamp,
                     active_trade_json,
-                    state.is_paused
+                    state.is_paused,
+                    state.leverage_ceiling
                 ))
             conn.commit()
         return True

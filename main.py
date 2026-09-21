@@ -15,7 +15,7 @@ import time
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from collections import deque
 
 import requests
@@ -57,22 +57,42 @@ class TitanDuoOrchestrator:
         self.db = DatabaseManager(config=config)
         self.db.init_tables()
         self.bot_state = self.db.load_bot_state()
-        logger.info(f"Loaded bot state from Neon. Wallet: ${self.bot_state.wallet_equity:,.2f} | Status: {'IN_TRADE' if self.bot_state.active_trade else 'IDLE'}")
+        logger.info(f"Loaded bot state from Neon. Wallet: ${self.bot_state.wallet_equity:,.2f} | Leverage: {self.bot_state.leverage_ceiling}x | Status: {'IN_TRADE' if self.bot_state.active_trade else 'IDLE'}")
 
         self.client = CoinSwitchFuturesClient(config=config)
         self.chaser = SmartOrderChaser(self.client, config)
         self.engine = StrategyEngine(config)
         self.telegram = TelegramNotifier(config)
 
-        # 2. In-Memory Candle Rolling Deques (Zero-Burn: No DB candle queries)
-        self.eth_candles_1h: deque = deque(maxlen=250)
-        self.btc_candles_4h: deque = deque(maxlen=100)
+        # 2. Sync Real Wallet Balance on Startup if in LIVE Mode
+        if self.mode == "LIVE":
+            self.sync_real_wallet_balance()
 
         # 3. Control Flags
         self._is_running = False
         self._stop_event = threading.Event()
+        self._last_evaluated_hour: Optional[int] = None
         self._setup_telegram_callbacks()
         self._inject_web_dependencies()
+
+    def sync_real_wallet_balance(self) -> float:
+        """
+        Queries CoinSwitch Futures USDT balance and syncs internal wallet equity.
+        """
+        try:
+            wb = self.client.get_wallet_balance()
+            for asset_item in wb.get("base_asset_balances", []):
+                if asset_item.get("base_asset") == "USDT":
+                    bal_str = asset_item.get("balances", {}).get("total_balance", "0")
+                    real_bal = float(bal_str)
+                    if real_bal > 0:
+                        logger.info(f"Live CoinSwitch Futures balance detected: ${real_bal:,.2f} USDT")
+                        self.bot_state.wallet_equity = real_bal
+                        self.db.save_bot_state(self.bot_state)
+                        return real_bal
+        except Exception as e:
+            logger.warning(f"Could not sync live wallet balance: {e}. Keeping current: ${self.bot_state.wallet_equity:,.2f}")
+        return self.bot_state.wallet_equity
 
     def _inject_web_dependencies(self):
         """Injects shared state into FastAPI web dashboard module."""
@@ -81,14 +101,21 @@ class TitanDuoOrchestrator:
         web_module.panic_callback = self.trigger_panic_killswitch
         web_module.pause_callback = self.pause_trading
         web_module.resume_callback = self.resume_trading
+        web_module.set_leverage_callback = self.update_leverage_ceiling
 
     def _setup_telegram_callbacks(self):
         """Registers interactive command dispatcher for Telegram bot."""
-        def handle_telegram_cmd(cmd: str) -> str:
+        def handle_telegram_cmd(cmd_text: str) -> str:
+            parts = cmd_text.split()
+            cmd = parts[0].lower()
             if cmd == "/status":
                 return self._cmd_status()
             elif cmd == "/levels":
                 return self._cmd_levels()
+            elif cmd == "/setleverage":
+                if len(parts) > 1 and parts[1].isdigit():
+                    return self.update_leverage_ceiling(int(parts[1]))
+                return "⚠️ Usage: `/setleverage <5-25>` (e.g. `/setleverage 20`)"
             elif cmd == "/panic":
                 return self.trigger_panic_killswitch()
             elif cmd == "/pause":
@@ -101,6 +128,7 @@ class TitanDuoOrchestrator:
                     "━━━━━━━━━━━━━━━━━━━━━━\n"
                     "📊 `/status` — Portfolio equity & active trade\n"
                     "🎯 `/levels` — Active Stop Loss, TP & Breakeven\n"
+                    "⚙️ `/setleverage <5-25>` — Update exchange leverage ceiling\n"
                     "⏸️ `/pause` — Pause new signal entries\n"
                     "▶️ `/resume` — Resume autonomous entries\n"
                     "🚨 `/panic` — Emergency market-close & cancel\n"
@@ -109,6 +137,30 @@ class TitanDuoOrchestrator:
             return "Unknown command. Use /help to see available commands."
 
         self.telegram.register_command_handler(handle_telegram_cmd)
+
+    def update_leverage_ceiling(self, leverage: int) -> str:
+        """
+        Dynamically updates leverage ceiling via Telegram or Web Dashboard.
+        Applies setting to CoinSwitch Pro and persists in Neon database.
+        """
+        if not (1 <= leverage <= 25):
+            return "⚠️ Invalid leverage: must be between 1x and 25x."
+
+        self.bot_state.leverage_ceiling = leverage
+        self.db.save_bot_state(self.bot_state)
+
+        # If bot is idle, update leverage on CoinSwitch exchange
+        exchange_msg = ""
+        if self.mode == "LIVE" and self.bot_state.active_trade is None:
+            try:
+                self.client.set_leverage("ETHUSDT", leverage)
+                self.client.set_leverage("BTCUSDT", leverage)
+                exchange_msg = f" (Updated on CoinSwitch Pro to {leverage}x)"
+            except Exception as e:
+                exchange_msg = f" (CoinSwitch update notice: {e})"
+
+        logger.info(f"Leverage ceiling set to {leverage}x by user command.")
+        return f"✅ *LEVERAGE UPDATED*: Leverage ceiling set to *{leverage}x*{exchange_msg}. Saved to database."
 
     def _cmd_status(self) -> str:
         inr_val = self.bot_state.wallet_equity * self.telegram.usdt_inr_rate
@@ -134,6 +186,7 @@ class TitanDuoOrchestrator:
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"💼 *Wallet*: `${self.bot_state.wallet_equity:,.2f} USD` (`₹{inr_val:,.0f} INR`)\n"
             f"⚙️ *Mode*: {mode_str} | {paused_str}\n"
+            f"⚡ *Leverage*: `{self.bot_state.leverage_ceiling}x`\n"
             f"🔥 *Streak*: `{self.bot_state.consecutive_wins} Wins` / `{self.bot_state.consecutive_losses} Losses`\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{pos_info}\n"
@@ -186,6 +239,11 @@ class TitanDuoOrchestrator:
             # 2. Market close position
             ob = self.client.get_order_book(trade.symbol)
             close_price = float(ob["bids"][0][0]) if trade.direction == 1 else float(ob["asks"][0][0])
+            
+            if self.mode == "LIVE":
+                opposing_side = "SELL" if trade.direction == 1 else "BUY"
+                self.client.place_market_order(trade.symbol, opposing_side, trade.current_units, reduce_only=True)
+
             gross_pnl = trade.current_units * (close_price - trade.entry_price) * trade.direction
             fee = (trade.entry_price + close_price) * trade.current_units * self.config.TAKER_FEE_PCT
             net_pnl = gross_pnl - fee
@@ -201,32 +259,142 @@ class TitanDuoOrchestrator:
             return f"Error executing panic: {e}"
 
     # --------------------------------------------------------------------------
-    # Market Data Seeding
+    # Order Execution & Stop-Loss Invariant
     # --------------------------------------------------------------------------
 
-    def seed_initial_candles(self):
+    def execute_entry(
+        self,
+        symbol: str,
+        direction: int,
+        entry_price: float,
+        atr: float,
+        timestamp: str
+    ) -> bool:
         """
-        Populates in-memory deques on boot using CoinSwitch historical KLines.
+        Executes order entry with:
+        1. Single-Position Mutex (Zero Correlated Risk)
+        2. Decimal Precision Sizing
+        3. Dynamic Pegged Limit Order Chaser
+        4. Hardware STOP_MARKET Placement
+        5. Emergency Immediate Liquidation Fail-Safe if SL fails
         """
-        logger.info("Seeding initial historical candles from CoinSwitch Pro...")
-        try:
-            # Fetch last 100 1h bars for ETH
-            headers, path = self.client._sign_request(
-                "GET", "/trade/api/v2/futures/klines",
-                {"symbol": "ETHUSDT", "exchange": "EXCHANGE_2", "interval": "60", "limit": 100}
+        # Mutex Check: Strictly one open position at a time
+        if self.bot_state.active_trade is not None:
+            logger.warning(f"Rejecting entry for {symbol}: Position already open in {self.bot_state.active_trade.symbol}")
+            return False
+
+        levels = self.engine.risk_manager.calculate_trade_levels(symbol, direction, entry_price, atr)
+        sizing = self.engine.risk_manager.calculate_position_size(
+            wallet_equity=self.bot_state.wallet_equity,
+            entry_price=entry_price,
+            stop_loss=levels['stop_loss'],
+            consec_losses=self.bot_state.consecutive_losses,
+            consec_wins=self.bot_state.consecutive_wins,
+            leverage_ceiling=self.bot_state.leverage_ceiling
+        )
+
+        raw_units = sizing['units']
+        units = self.engine.risk_manager.format_order_quantity(symbol, raw_units)
+        is_valid, reason = self.engine.risk_manager.validate_order_constraints(symbol, units, entry_price)
+
+        if not is_valid:
+            logger.warning(f"Order constraints not met for {symbol}: {reason}")
+            return False
+
+        if self.mode == "LIVE":
+            # 1. Place limit order with SmartOrderChaser
+            chase_result = self.chaser.execute_smart_limit_entry(
+                symbol=symbol,
+                direction=direction,
+                quantity=units,
+                signal_candle_close=entry_price
             )
-            resp = requests.get(f"{self.client.base_url}{path}", headers=headers, timeout=10)
-            if resp.status_code == 200:
-                raw_k = resp.json().get("data", [])
-                for k in raw_k:
-                    self.eth_candles_1h.append({
-                        "open": float(k["o"]), "high": float(k["h"]),
-                        "low": float(k["l"]), "close": float(k["c"]),
-                        "volume": float(k["volume"])
-                    })
-                logger.info(f"Seeded {len(self.eth_candles_1h)} ETH 1h candles.")
-        except Exception as e:
-            logger.warning(f"Could not seed ETH candles from API: {e}. Falling back to clean buffer.")
+
+            if not chase_result.get("success"):
+                logger.warning(f"Order entry aborted: {chase_result.get('reason')}")
+                return False
+
+            fill_price = chase_result.get("fill_price", entry_price)
+            levels = self.engine.risk_manager.calculate_trade_levels(symbol, direction, fill_price, atr)
+
+            # 2. CRITICAL INVARIANT: Immediate Hardware Stop-Loss Order Placement
+            sl_side = "SELL" if direction == 1 else "BUY"
+            sl_price = self.engine.risk_manager.format_price(symbol, levels['stop_loss'])
+            sl_order_id = None
+
+            try:
+                sl_res = self.client.place_stop_market_order(
+                    symbol=symbol,
+                    side=sl_side,
+                    trigger_price=sl_price,
+                    reduce_only=True
+                )
+                sl_order_id = sl_res.get("order_id")
+                logger.info(f"Hardware STOP_MARKET placed on CoinSwitch @ {sl_price} (ID: {sl_order_id})")
+            except Exception as sl_err:
+                logger.critical(f"FATAL: Stop-Loss order placement failed on exchange: {sl_err}")
+                # EMERGENCY ABORT FAIL-SAFE: Liquidate immediately via Market Order
+                try:
+                    self.client.place_market_order(symbol, sl_side, units, reduce_only=True)
+                    self.telegram.send_message(
+                        f"🚨 *CRITICAL FAIL-SAFE ACTIVATED*\n"
+                        f"Stop-Loss order rejected by CoinSwitch ({sl_err})!\n"
+                        f"Position for `{symbol}` was IMMEDIATELY LIQUIDATED at market to prevent unhedged capital exposure."
+                    )
+                except Exception as abort_err:
+                    logger.critical(f"FATAL: Emergency liquidation failed: {abort_err}")
+                    self.telegram.send_message(f"🚨🚨 *FATAL*: Stop-Loss failed AND market liquidation failed: {abort_err}")
+                return False
+
+            active_trade = ActiveTrade(
+                symbol=symbol,
+                direction=direction,
+                entry_price=fill_price,
+                initial_units=units,
+                current_units=units,
+                stop_loss=levels['stop_loss'],
+                take_profit=levels['take_profit'],
+                pyramid_trigger=levels['pyramid_trigger'],
+                breakeven_sl=levels['breakeven_sl'],
+                atr_at_entry=atr,
+                effective_risk_pct=sizing['effective_risk_pct'],
+                entry_timestamp=timestamp,
+                status=TradeStatus.IN_TRADE,
+                order_id=chase_result.get("order_id"),
+                exchange_sl_order_id=sl_order_id
+            )
+        else:
+            # PAPER SIMULATION MODE
+            active_trade = ActiveTrade(
+                symbol=symbol,
+                direction=direction,
+                entry_price=entry_price,
+                initial_units=units,
+                current_units=units,
+                stop_loss=levels['stop_loss'],
+                take_profit=levels['take_profit'],
+                pyramid_trigger=levels['pyramid_trigger'],
+                breakeven_sl=levels['breakeven_sl'],
+                atr_at_entry=atr,
+                effective_risk_pct=sizing['effective_risk_pct'],
+                entry_timestamp=timestamp,
+                status=TradeStatus.IN_TRADE
+            )
+
+        self.bot_state.active_trade = active_trade
+        self.db.save_bot_state(self.bot_state)
+        self.telegram.notify_trade_opened(active_trade, self.bot_state.wallet_equity)
+        logger.info(f"Position successfully established for {symbol} ({'LONG' if direction == 1 else 'SHORT'}) @ {active_trade.entry_price}")
+        return True
+
+    def get_seconds_until_next_candle_close(self) -> float:
+        """
+        Calculates seconds until next hourly candle close (XX:30:02 IST = XX:00:02 UTC).
+        """
+        now_utc = datetime.now(timezone.utc)
+        next_hour = (now_utc + timedelta(hours=1)).replace(minute=0, second=2, microsecond=0)
+        delta_sec = (next_hour - now_utc).total_seconds()
+        return max(delta_sec, 2.0)
 
     # --------------------------------------------------------------------------
     # Fast Position Monitoring Loop (Runs Every 10 Seconds when In-Trade)
@@ -251,7 +419,6 @@ class TitanDuoOrchestrator:
             if not trade.is_pyramided:
                 be_hit = (current_price >= trade.pyramid_trigger) if trade.direction == 1 else (current_price <= trade.pyramid_trigger)
                 if be_hit:
-                    # Ratchet SL above Breakeven (+0.2% fee buffer)
                     trade.stop_loss = trade.breakeven_sl
                     trade.is_be_locked = True
                     added_units, total_units = self.engine.risk_manager.calculate_pyramid_tranche(trade.initial_units)
@@ -266,7 +433,7 @@ class TitanDuoOrchestrator:
                             self.client.place_stop_market_order(
                                 symbol=trade.symbol,
                                 side="SELL" if trade.direction == 1 else "BUY",
-                                trigger_price=trade.stop_loss,
+                                trigger_price=self.engine.risk_manager.format_price(trade.symbol, trade.stop_loss),
                                 reduce_only=True
                             )
                         except Exception as e:
@@ -296,6 +463,14 @@ class TitanDuoOrchestrator:
                     exit_reason = ExitReason.TAKE_PROFIT
 
             if exit_price > 0:
+                if self.mode == "LIVE":
+                    try:
+                        self.client.cancel_all_open_orders(trade.symbol)
+                        opposing_side = "SELL" if trade.direction == 1 else "BUY"
+                        self.client.place_market_order(trade.symbol, opposing_side, trade.current_units, reduce_only=True)
+                    except Exception as e:
+                        logger.error(f"Live market close error: {e}")
+
                 gross_pnl = trade.current_units * (exit_price - trade.entry_price) * trade.direction
                 fee = (trade.entry_price + exit_price) * trade.current_units * self.config.TAKER_FEE_PCT
                 net_pnl = gross_pnl - fee
@@ -333,18 +508,93 @@ class TitanDuoOrchestrator:
             logger.error(f"Error during active trade monitoring: {e}")
 
     # --------------------------------------------------------------------------
-    # Candle Close Calculation & Sleep Synchronizer (XX:30:02 IST)
+    # Hourly Candle Evaluation (Minute 30 IST / Minute 00 UTC)
     # --------------------------------------------------------------------------
 
-    def get_seconds_until_next_candle_close(self) -> float:
+    def evaluate_hourly_candle(self):
         """
-        Calculates seconds until next hourly candle close (XX:30:02 IST = XX:00:02 UTC).
+        Executes at XX:30:02 IST (when 1h candle closes).
+        Queries fresh candles from CoinSwitch, calculates indicators,
+        and executes entries if signals trigger.
         """
-        now_utc = datetime.now(timezone.utc)
-        # Next full hour in UTC
-        next_hour = (now_utc + timedelta(hours=1)).replace(minute=0, second=2, microsecond=0)
-        delta_sec = (next_hour - now_utc).total_seconds()
-        return max(delta_sec, 2.0)
+        now_dt = datetime.now(timezone.utc)
+        logger.info(f"Evaluating hourly candle at {now_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}...")
+
+        if self.bot_state.is_paused:
+            logger.info("Bot is PAUSED. Skipping candle evaluation.")
+            return
+
+        if self.bot_state.active_trade is not None:
+            logger.info(f"Single-Position Mutex Active: Already in trade on {self.bot_state.active_trade.symbol}. Skipping scan.")
+            return
+
+        try:
+            # 1. Fetch ETH 1h candles
+            resp_eth = self.client._send_request(
+                "GET", "/trade/api/v2/futures/klines",
+                params={"symbol": "ETHUSDT", "exchange": "EXCHANGE_2", "interval": "60", "limit": 220}
+            )
+            if resp_eth.status_code != 200:
+                logger.error(f"Failed to fetch ETH klines: {resp_eth.text}")
+                return
+
+            raw_eth = resp_eth.json().get("data", [])
+            eth_records = [
+                {"open": float(k["o"]), "high": float(k["h"]), "low": float(k["l"]), "close": float(k["c"]), "volume": float(k["volume"])}
+                for k in reversed(raw_eth)
+            ]
+            df_eth = pd.DataFrame(eth_records)
+            ind_eth = self.engine.signal_generator.calculate_eth_indicators(df_eth)
+            l_sig_eth, s_sig_eth = self.engine.signal_generator.evaluate_eth_signals_vectorized(ind_eth)
+
+            eth_has_long = bool(l_sig_eth[-1])
+            eth_has_short = bool(s_sig_eth[-1])
+            eth_close = float(df_eth["close"].iloc[-1])
+            eth_atr = float(ind_eth["atr"][-1])
+
+            # Check ETH Signal
+            if eth_has_long or eth_has_short:
+                direction = 1 if eth_has_long else -1
+                timestamp_str = now_dt.isoformat()
+                logger.info(f"ETH Signal Triggered! Direction: {'LONG' if direction == 1 else 'SHORT'} @ {eth_close}")
+                self.execute_entry("ETHUSDT", direction, eth_close, eth_atr, timestamp_str)
+                return
+
+            # 2. If no ETH signal, check BTC 4h candles
+            resp_btc = self.client._send_request(
+                "GET", "/trade/api/v2/futures/klines",
+                params={"symbol": "BTCUSDT", "exchange": "EXCHANGE_2", "interval": "240", "limit": 50}
+            )
+            if resp_btc.status_code == 200:
+                raw_btc = resp_btc.json().get("data", [])
+                btc_records = [
+                    {"open": float(k["o"]), "high": float(k["h"]), "low": float(k["l"]), "close": float(k["c"]), "volume": float(k["volume"])}
+                    for k in reversed(raw_btc)
+                ]
+                df_btc = pd.DataFrame(btc_records)
+                ind_btc = self.engine.signal_generator.calculate_btc_indicators(df_btc)
+                l_sig_btc, s_sig_btc = self.engine.signal_generator.evaluate_btc_signals_vectorized(ind_btc)
+
+                btc_has_long = bool(l_sig_btc[-1])
+                btc_has_short = bool(s_sig_btc[-1])
+                btc_close = float(df_btc["close"].iloc[-1])
+                btc_atr = float(ind_btc["atr"][-1])
+
+                if btc_has_long or btc_has_short:
+                    direction = 1 if btc_has_long else -1
+                    timestamp_str = now_dt.isoformat()
+                    logger.info(f"BTC Signal Triggered! Direction: {'LONG' if direction == 1 else 'SHORT'} @ {btc_close}")
+                    self.execute_entry("BTCUSDT", direction, btc_close, btc_atr, timestamp_str)
+                    return
+
+            logger.info("Hourly scan complete: No breakout signals. Portfolio remains 100% USDT Cash.")
+
+        except Exception as e:
+            logger.error(f"Error evaluating hourly candle: {e}")
+
+    # --------------------------------------------------------------------------
+    # Main Daemon Loop
+    # --------------------------------------------------------------------------
 
     def run_main_loop(self):
         """
@@ -352,7 +602,6 @@ class TitanDuoOrchestrator:
         """
         self._is_running = True
         self.telegram.start_polling()
-        self.seed_initial_candles()
 
         logger.info("Titan Duo Autonomous Trading Daemon successfully started.")
 
@@ -360,15 +609,20 @@ class TitanDuoOrchestrator:
 
         while self._is_running and not self._stop_event.is_set():
             try:
-                now = time.time()
+                now_utc = datetime.now(timezone.utc)
+                now_ts = time.time()
 
-                # Fast 10-Second Watcher Loop (Active Position Tracking)
+                # 1. Fast 10-Second Watcher Loop (Active Position Tracking)
                 if self.bot_state.active_trade is not None:
-                    if now - last_fast_check >= self.config.ORDER_CHASER_POLL_INTERVAL:
+                    if now_ts - last_fast_check >= self.config.ORDER_CHASER_POLL_INTERVAL:
                         self.check_active_trade_lifecycle()
-                        last_fast_check = now
+                        last_fast_check = now_ts
 
-                # Sleep small slice to avoid busy-waiting
+                # 2. Hourly Candle Evaluation at XX:00:02 UTC (= XX:30:02 IST)
+                if now_utc.minute == 0 and now_utc.second >= 2 and self._last_evaluated_hour != now_utc.hour:
+                    self._last_evaluated_hour = now_utc.hour
+                    self.evaluate_hourly_candle()
+
                 time.sleep(1.0)
 
             except KeyboardInterrupt:
@@ -381,9 +635,7 @@ class TitanDuoOrchestrator:
         self.stop()
 
     def stop(self):
-        """
-        Graceful shutdown sequence.
-        """
+        """Graceful shutdown sequence."""
         self._is_running = False
         self._stop_event.set()
         self.telegram.stop_polling()
@@ -404,9 +656,6 @@ if __name__ == "__main__":
     mode = os.getenv("EXECUTION_MODE", "PAPER")
     port = int(os.getenv("PORT", "8000"))
     
-    # Start web dashboard
     start_server_in_background(host="0.0.0.0", port=port)
-    
-    # Start bot orchestrator
     bot = TitanDuoOrchestrator(mode=mode)
     bot.run_main_loop()
