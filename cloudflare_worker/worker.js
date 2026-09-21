@@ -3,7 +3,7 @@
  * ======================================================
  * Transparent, zero-logging pass-through reverse proxy.
  * Routes API requests from Render through Cloudflare's clean edge network
- * directly to CoinSwitch Pro matching engine (https://api-trading.coinswitch.co).
+ * directly to CoinSwitch Pro matching engine (https://coinswitch.co).
  * 
  * Free Tier Quota: 100,000 requests/day (Bot uses ~1,500/day = 1.5%)
  */
@@ -24,12 +24,12 @@ export default {
 
     try {
       const incomingUrl = new URL(request.url);
-      const targetBase = "https://api-trading.coinswitch.co";
+      const targetBase = "https://coinswitch.co";
       const targetUrl = `${targetBase}${incomingUrl.pathname}${incomingUrl.search}`;
 
       // Clone original headers (including Ed25519 signature headers)
       const newHeaders = new Headers(request.headers);
-      newHeaders.set("Host", "api-trading.coinswitch.co");
+      newHeaders.set("Host", "coinswitch.co");
 
       // Pass through the exact request
       const proxyRequest = new Request(targetUrl, {
