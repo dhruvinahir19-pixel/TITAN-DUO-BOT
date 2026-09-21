@@ -3,7 +3,7 @@ TITAN DUO v4.0 APEX - RISK MANAGEMENT & SIZING MODULE
 =====================================================
 Calculates exact mathematical position sizing, dynamic streak scaling,
 hard leverage caps, stop loss, take profit, risk-free pyramiding levels,
-and exchange-enforced decimal precision formatting.
+and exchange-enforced decimal precision formatting with Small-Account Protection.
 """
 
 import math
@@ -98,11 +98,13 @@ class RiskManager:
         stop_loss: float,
         consec_losses: int,
         consec_wins: int,
-        leverage_ceiling: Optional[float] = None
+        leverage_ceiling: Optional[float] = None,
+        symbol: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Calculates unit quantity ensuring risk budget is respected and
         effective leverage NEVER exceeds the leverage ceiling.
+        Includes Small-Account Floor Rule for micro accounts ($10 - $50).
         """
         if wallet_equity < self.config.MIN_WALLET_BALANCE_USDT:
             return {
@@ -121,14 +123,24 @@ class RiskManager:
         effective_risk_pct = self.calculate_effective_risk_pct(consec_losses, consec_wins)
         risk_capital = wallet_equity * effective_risk_pct
         raw_units = risk_capital / unit_risk
-        notional_value = raw_units * entry_price
         
-        # Effective Leverage Ceiling check (e.g. 5x base, or user specified ceiling)
+        # Effective Leverage Ceiling check
         effective_cap = leverage_ceiling if leverage_ceiling else self.config.MAX_EFFECTIVE_LEVERAGE
         max_allowable_notional = wallet_equity * effective_cap
+        
+        # Small-Account Floor Rule (Micro-Capital Sizing Floor for balances < $50 USD)
+        min_lot = 0.001 if (symbol and "BTC" in symbol.upper()) else 0.01
+        min_lot_notional = min_lot * entry_price
+        min_lot_margin_needed = min_lot_notional / effective_cap
+        
+        # If account is under $50 and has sufficient margin to hold 1 minimum lot safely:
+        if wallet_equity < 50.0 and raw_units < min_lot and min_lot_margin_needed <= (wallet_equity * 0.50):
+            raw_units = min_lot
+            
+        notional_value = raw_units * entry_price
         leverage_capped = False
         
-        if notional_value > max_allowable_notional:
+        if notional_value > max_allowable_notional and raw_units > min_lot:
             raw_units = max_allowable_notional / entry_price
             notional_value = max_allowable_notional
             leverage_capped = True

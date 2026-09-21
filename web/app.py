@@ -82,6 +82,7 @@ def get_api_status():
     return {
         "state": state_dict,
         "summary": summary,
+        "mode": os.getenv("EXECUTION_MODE", "LIVE"),
         "uptime": get_uptime_str(),
         "proxy_url": CONFIG.COINSWITCH_PROXY_URL,
         "timestamp": int(time.time())
@@ -143,10 +144,16 @@ def trigger_set_leverage(action: LeverageAction):
 
 @app.get("/", response_class=HTMLResponse)
 def serve_dashboard():
-    equity = current_bot_state.wallet_equity if current_bot_state else 100.0
+    equity = current_bot_state.wallet_equity if current_bot_state else 10.62
     equity_inr = equity * 85.50
     trade = current_bot_state.active_trade if current_bot_state else None
     lev = current_bot_state.leverage_ceiling if current_bot_state else 20
+    exec_mode = os.getenv("EXECUTION_MODE", "LIVE").upper()
+    mode_badge_html = (
+        '<span class="badge badge-live" id="mode-badge"><span class="badge-pulse"></span>LIVE CAPITAL (COINSWITCH PRO)</span>'
+        if exec_mode == "LIVE" else
+        '<span class="badge badge-paper" id="mode-badge">PAPER TRADING (₹0 RISK)</span>'
+    )
     
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -476,9 +483,7 @@ def serve_dashboard():
                 <span class="badge-pulse"></span>
                 <span>24/7 ONLINE (SINGAPORE)</span>
             </span>
-            <span class="badge badge-paper" id="mode-badge">
-                PAPER TRADING (₹0 RISK)
-            </span>
+            {mode_badge_html}
             <button class="btn-action btn-leverage" onclick="promptLeverage()">
                 ⚡ LEVERAGE: <span id="current-leverage">{lev}x</span>
             </button>
@@ -497,7 +502,7 @@ def serve_dashboard():
             </div>
             <div class="kpi-value tabular glow-indigo" id="equity-usd">${equity:,.2f}</div>
             <div class="kpi-subtext tabular glow-green" id="equity-inr">
-                ₹{equity_inr:,.0f} INR <span style="color: var(--text-faint);">(Base $100 / ₹8,500)</span>
+                ₹{equity_inr:,.0f} INR <span style="color: var(--text-faint);">(Live CoinSwitch DMA Balance)</span>
             </div>
         </div>
 
@@ -694,9 +699,9 @@ def serve_dashboard():
                 const statusRes = await fetch('/api/status');
                 const statusData = await statusRes.json();
                 if (statusData && statusData.state) {{
-                    const eq = parseFloat(statusData.state.wallet_equity || 100.0);
+                    const eq = parseFloat(statusData.state.wallet_equity || 10.62);
                     document.getElementById('equity-usd').textContent = `$${{eq.toFixed(2)}}`;
-                    document.getElementById('equity-inr').innerHTML = `₹${{(eq * 85.50).toFixed(0)}} INR <span style="color: var(--text-faint);">(Base $100 / ₹8,500)</span>`;
+                    document.getElementById('equity-inr').innerHTML = `₹${{(eq * 85.50).toFixed(0)}} INR <span style="color: var(--text-faint);">(Live CoinSwitch DMA Balance)</span>`;
                     
                     const lossStreak = statusData.state.consecutive_losses || 0;
                     const winStreak = statusData.state.consecutive_wins || 0;
@@ -705,6 +710,19 @@ def serve_dashboard():
                     const lev = statusData.state.leverage_ceiling || 20;
                     const levEl = document.getElementById('current-leverage');
                     if (levEl) levEl.textContent = `${{lev}}x`;
+
+                    if (statusData.mode) {{
+                        const badge = document.getElementById('mode-badge');
+                        if (badge) {{
+                            if (statusData.mode.toUpperCase() === 'LIVE') {{
+                                badge.className = 'badge badge-live';
+                                badge.innerHTML = '<span class="badge-pulse"></span>LIVE CAPITAL (COINSWITCH PRO)';
+                            }} else {{
+                                badge.className = 'badge badge-paper';
+                                badge.innerHTML = 'PAPER TRADING (₹0 RISK)';
+                            }}
+                        }}
+                    }}
                 }}
 
                 const tradesRes = await fetch('/api/trades');
