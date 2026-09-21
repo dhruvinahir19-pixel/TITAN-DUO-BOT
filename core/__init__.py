@@ -15,6 +15,7 @@ from core.risk_manager import RiskManager
 from core.signal_generator import SignalGenerator, SignalResult
 from core.trade_state import BotState, ActiveTrade, TradeStatus, ExitReason
 from core.strategy_engine import StrategyEngine
+from core.db_manager import DatabaseManager
 
 __all__ = [
     "calc_ema_numba",
@@ -31,5 +32,6 @@ __all__ = [
     "ActiveTrade",
     "TradeStatus",
     "ExitReason",
-    "StrategyEngine"
+    "StrategyEngine",
+    "DatabaseManager"
 ]

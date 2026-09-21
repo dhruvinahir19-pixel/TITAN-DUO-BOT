@@ -5,13 +5,21 @@ Centralized institutional configuration for BTCUSDT (4h) & ETHUSDT (1h)
 execution on CoinSwitch Pro Perpetual Futures.
 """
 
+import os
 from dataclasses import dataclass
+from dotenv import load_dotenv
+
+# Load environment variables from .env if present
+load_dotenv()
 
 @dataclass(frozen=True)
 class TradingConfig:
     # --- Strategy Identity ---
     STRATEGY_NAME: str = "TITAN_DUO_APEX"
     VERSION: str = "4.2.0"
+    
+    # --- Database & Infrastructure ---
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
     
     # --- Target Instruments & Timeframes ---
     PRIMARY_SYMBOL: str = "ETHUSDT"        # 1-Hour candles
