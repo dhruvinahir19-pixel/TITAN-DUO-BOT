@@ -43,6 +43,20 @@ pause_callback = None
 resume_callback = None
 set_leverage_callback = None
 
+def ensure_initialized():
+    global db_manager, current_bot_state
+    if db_manager is None:
+        try:
+            db_manager = DatabaseManager(config=CONFIG)
+            db_manager.init_tables()
+        except Exception:
+            pass
+    if current_bot_state is None and db_manager:
+        try:
+            current_bot_state = db_manager.load_bot_state()
+        except Exception:
+            pass
+
 def get_uptime_str() -> str:
     elapsed = int(time.time() - START_TIME)
     hours = elapsed // 3600
@@ -53,7 +67,8 @@ def get_uptime_str() -> str:
 @app.get("/ping")
 @app.get("/health")
 def keep_alive_ping():
-    equity = current_bot_state.wallet_equity if current_bot_state else 100.0
+    ensure_initialized()
+    equity = current_bot_state.wallet_equity if current_bot_state else 10.62
     status_str = "ACTIVE" if (current_bot_state and current_bot_state.active_trade) else "IDLE"
     paused_str = "PAUSED" if (current_bot_state and current_bot_state.is_paused) else "RUNNING"
     lev = current_bot_state.leverage_ceiling if current_bot_state else 20
@@ -71,6 +86,7 @@ def keep_alive_ping():
 
 @app.get("/api/status")
 def get_api_status():
+    ensure_initialized()
     state_dict = current_bot_state.to_dict() if current_bot_state else {}
     summary = {}
     if db_manager:
@@ -90,6 +106,7 @@ def get_api_status():
 
 @app.get("/api/trades")
 def get_closed_trades(limit: int = 50):
+    ensure_initialized()
     if db_manager:
         try:
             return db_manager.get_recent_trades(limit=limit)
@@ -144,6 +161,7 @@ def trigger_set_leverage(action: LeverageAction):
 
 @app.get("/", response_class=HTMLResponse)
 def serve_dashboard():
+    ensure_initialized()
     equity = current_bot_state.wallet_equity if current_bot_state else 10.62
     equity_inr = equity * 85.50
     trade = current_bot_state.active_trade if current_bot_state else None
