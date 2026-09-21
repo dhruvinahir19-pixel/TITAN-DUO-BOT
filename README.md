@@ -3,6 +3,8 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: Proprietary](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE)
 [![Verification: 100% Passed](https://img.shields.io/badge/Tests-40%20Passed%20(100%25)-brightgreen.svg)](tests/)
+[![Production: Ready](https://img.shields.io/badge/Status-Production%20Ready%20(24%2F7)-brightgreen.svg)](DEPLOYMENT_GUIDE.md)
+[![Hosting: Render Singapore](https://img.shields.io/badge/Hosting-Render.com%20Singapore-blue.svg)](render.yaml)
 [![Paper Trading: Live Feed](https://img.shields.io/badge/Paper%20Trading-Live%20Orderbook%20Verified-brightgreen.svg)](main.py)
 [![Notifications: Telegram](https://img.shields.io/badge/Alerts-Telegram%20Two--Way-blue.svg)](core/telegram_bot.py)
 [![UI: Web Dashboard](https://img.shields.io/badge/Dashboard-FastAPI%20Dark--Mode-indigo.svg)](web/app.py)
