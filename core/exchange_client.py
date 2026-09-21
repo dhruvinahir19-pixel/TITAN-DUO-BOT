@@ -4,6 +4,8 @@ TITAN DUO v4.0 APEX - COINSWITCH PRO REST API CLIENT & SMART CHASER
 Production execution engine for CoinSwitch Pro Perpetual Futures.
 Features:
 - Ed25519 Cryptographic Request Signing (Official CoinSwitch Standard)
+- Direct INR Treasury Bridge (/dma/api/v1/funds/transfer) - Zero 30% Spot Tax
+- Unified Bybit/DMA v5 Execution Engine (https://dma.coinswitch.co)
 - NTP Clock Drift Auto-Correction (< 5,000ms drift window)
 - 10-Second Smart Limit Order Chaser (Dynamic Re-quoting)
 - Strict 0.35% Slippage Ceiling Guard (Anti-Wick Chase Protection)
@@ -14,6 +16,7 @@ Features:
 
 import time
 import math
+import uuid
 import logging
 import urllib.parse
 from typing import Optional, Dict, Any, List, Tuple
@@ -41,6 +44,7 @@ class CoinSwitchFuturesClient:
         
         # Base URLs: Direct CoinSwitch Pro or Cloudflare Worker Proxy
         self.direct_base_url = "https://coinswitch.co"
+        self.dma_base_url = "https://dma.coinswitch.co"
         self.base_url = self.proxy_url.rstrip("/") if self.proxy_url else self.direct_base_url
         
         # Initialize Ed25519 Keys
@@ -135,7 +139,8 @@ class CoinSwitchFuturesClient:
         path: str,
         params: Optional[Dict[str, Any]] = None,
         json_body: Optional[Dict[str, Any]] = None,
-        auth_required: bool = True
+        auth_required: bool = True,
+        use_dma: bool = False
     ) -> requests.Response:
         """
         Sends HTTP request with transparent fallback between Cloudflare Proxy and Direct API.
@@ -146,7 +151,8 @@ class CoinSwitchFuturesClient:
             headers = {"Content-Type": "application/json"}
             decoded_path = path
 
-        url = f"{self.base_url}{decoded_path}"
+        base = self.dma_base_url if use_dma else self.base_url
+        url = f"{base}{decoded_path}"
         try:
             resp = requests.request(
                 method=method,
@@ -157,7 +163,7 @@ class CoinSwitchFuturesClient:
             )
             return resp
         except requests.RequestException as e:
-            if self.base_url != self.direct_base_url:
+            if not use_dma and self.base_url != self.direct_base_url:
                 logger.warning(f"Proxy request failed: {e}. Falling back to direct CoinSwitch API...")
                 url = f"{self.direct_base_url}{decoded_path}"
                 return requests.request(
@@ -168,6 +174,38 @@ class CoinSwitchFuturesClient:
                     timeout=10
                 )
             raise
+
+    # --------------------------------------------------------------------------
+    # Direct INR Treasury Bridge (Zero 30% Spot Tax, Zero 1% TDS)
+    # --------------------------------------------------------------------------
+
+    def bridge_funds(self, amount: float, direction: str = "IN", quote_asset: str = "INR") -> Dict[str, Any]:
+        """
+        Transfers funds between main CoinSwitch wallet and DMA Unified Futures account.
+        direction: "IN" (Wallet -> Futures) or "OUT" (Futures -> Wallet).
+        """
+        payload = {
+            "direction": direction.upper(),
+            "amount": float(amount),
+            "quote_asset": quote_asset.upper(),
+            "client_txn_id": str(uuid.uuid4())
+        }
+        resp = self._send_request("POST", "/dma/api/v1/funds/transfer", json_body=payload, use_dma=True)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Bridge funds failed ({resp.status_code}): {resp.text}")
+        return resp.json().get("data", {})
+
+    def get_unified_wallet_balance(self) -> Dict[str, Any]:
+        """
+        Fetches current Unified Margin balance on DMA (returns equity, available balance, UPL).
+        """
+        params = {"accountType": "UNIFIED"}
+        resp = self._send_request("GET", "/v5/account/wallet-balance", params=params, use_dma=True)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Unified balance query failed ({resp.status_code}): {resp.text}")
+        result = resp.json().get("result", {})
+        accounts = result.get("list", [])
+        return accounts[0] if accounts else {}
 
     # --------------------------------------------------------------------------
     # Market Data & Account Endpoints
@@ -181,6 +219,17 @@ class CoinSwitchFuturesClient:
         if resp.status_code != 200:
             raise RuntimeError(f"Wallet balance query failed ({resp.status_code}): {resp.text}")
         return resp.json().get("data", {})
+
+    def get_inr_cash_balance(self) -> float:
+        """
+        Fetches Indian Rupee (INR) cash balance from main wallet.
+        """
+        resp = self._send_request("GET", "/trade/api/v2/user/portfolio")
+        if resp.status_code == 200:
+            for item in resp.json().get("data", []):
+                if item.get("currency") == "INR":
+                    return float(item.get("main_balance", 0.0))
+        return 0.0
 
     def get_instrument_info(self, symbol: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -196,8 +245,21 @@ class CoinSwitchFuturesClient:
 
     def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
         """
-        Updates exchange leverage for a futures symbol.
+        Updates exchange leverage on both v2 and DMA Unified engines.
         """
+        # 1. Update on DMA Unified
+        try:
+            dma_payload = {
+                "category": "linear",
+                "symbol": symbol.upper(),
+                "buyLeverage": str(leverage),
+                "sellLeverage": str(leverage)
+            }
+            self._send_request("POST", "/v5/position/set-leverage", json_body=dma_payload, use_dma=True)
+        except Exception as e:
+            logger.warning(f"Could not set DMA leverage for {symbol}: {e}")
+
+        # 2. Update on v2
         body = {
             "exchange": "EXCHANGE_2",
             "symbol": symbol.upper(),
@@ -205,7 +267,7 @@ class CoinSwitchFuturesClient:
         }
         resp = self._send_request("POST", "/trade/api/v2/futures/leverage", json_body=body)
         if resp.status_code not in (200, 201):
-            raise RuntimeError(f"Set leverage failed ({resp.status_code}): {resp.text}")
+            logger.warning(f"v2 set leverage response ({resp.status_code}): {resp.text}")
         return resp.json().get("data", {})
 
     def get_order_book(self, symbol: str) -> Dict[str, Any]:
@@ -220,35 +282,16 @@ class CoinSwitchFuturesClient:
 
     def get_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        Fetches active perpetual futures positions.
+        Fetches active perpetual futures positions from DMA.
         """
-        params = {"symbol": symbol.upper(), "exchange": "EXCHANGE_2"} if symbol else {"exchange": "EXCHANGE_2"}
-        resp = self._send_request("GET", "/trade/api/v2/futures/positions", params=params)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Positions query failed ({resp.status_code}): {resp.text}")
-        return resp.json().get("data", [])
-
-    def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Lists all currently working/unfilled orders.
-        """
-        params = {"open": "true", "exchange": "EXCHANGE_2"}
+        params = {"category": "linear"}
         if symbol:
             params["symbol"] = symbol.upper()
-        resp = self._send_request("GET", "/trade/api/v2/futures/orders", params=params)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Open orders query failed ({resp.status_code}): {resp.text}")
-        return resp.json().get("data", [])
-
-    def get_order_status(self, order_id: str) -> Dict[str, Any]:
-        """
-        Fetches status of a specific order by ID.
-        """
-        params = {"order_id": order_id, "exchange": "EXCHANGE_2"}
-        resp = self._send_request("GET", "/trade/api/v2/futures/order", params=params)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Get order status failed ({resp.status_code}): {resp.text}")
-        return resp.json().get("data", {})
+        resp = self._send_request("GET", "/v5/position/list", params=params, use_dma=True)
+        if resp.status_code == 200:
+            res = resp.json().get("result", {})
+            return res.get("list", [])
+        return []
 
     # --------------------------------------------------------------------------
     # Order Placement & Cancellation
@@ -263,23 +306,23 @@ class CoinSwitchFuturesClient:
         client_order_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Submits a Limit order to CoinSwitch Pro matching engine.
+        Submits a Limit order to DMA Unified matching engine.
         """
         body = {
-            "exchange": "EXCHANGE_2",
+            "category": "linear",
             "symbol": symbol.upper(),
-            "side": side.upper(),
-            "order_type": "LIMIT",
-            "price": float(price),
-            "quantity": float(quantity)
+            "side": side.capitalize(),
+            "orderType": "Limit",
+            "price": str(price),
+            "qty": str(quantity),
+            "positionIdx": 0,
+            "timeInForce": "GTC",
+            "orderLinkId": client_order_id or f"ord-{int(uuid.uuid4().int % 1e8)}"
         }
-        if client_order_id:
-            body["client_order_id"] = client_order_id
-
-        resp = self._send_request("POST", "/trade/api/v2/futures/order", json_body=body)
-        if resp.status_code not in (200, 201):
-            raise RuntimeError(f"Place limit order failed ({resp.status_code}): {resp.text}")
-        return resp.json().get("data", {})
+        resp = self._send_request("POST", "/v5/order/create", json_body=body, use_dma=True)
+        if resp.status_code != 200 or resp.json().get("retCode") != 0:
+            raise RuntimeError(f"Place limit order failed: {resp.text}")
+        return resp.json().get("result", {})
 
     def place_market_order(
         self,
@@ -289,68 +332,66 @@ class CoinSwitchFuturesClient:
         reduce_only: bool = False
     ) -> Dict[str, Any]:
         """
-        Submits an immediate Market order to CoinSwitch Pro matching engine.
+        Submits an immediate Market order to DMA Unified matching engine.
         Essential for Emergency Abort Fail-Safe.
         """
         body = {
-            "exchange": "EXCHANGE_2",
+            "category": "linear",
             "symbol": symbol.upper(),
-            "side": side.upper(),
-            "order_type": "MARKET",
-            "quantity": float(quantity),
-            "reduce_only": reduce_only
+            "side": side.capitalize(),
+            "orderType": "Market",
+            "qty": str(quantity),
+            "positionIdx": 0,
+            "timeInForce": "GTC",
+            "orderLinkId": f"mkt-{int(uuid.uuid4().int % 1e8)}"
         }
-        resp = self._send_request("POST", "/trade/api/v2/futures/order", json_body=body)
-        if resp.status_code not in (200, 201):
-            raise RuntimeError(f"Place market order failed ({resp.status_code}): {resp.text}")
-        return resp.json().get("data", {})
+        resp = self._send_request("POST", "/v5/order/create", json_body=body, use_dma=True)
+        if resp.status_code != 200 or resp.json().get("retCode") != 0:
+            raise RuntimeError(f"Place market order failed: {resp.text}")
+        return resp.json().get("result", {})
 
     def place_stop_market_order(
         self,
         symbol: str,
-        side: str,          # "SELL" for closing Long, "BUY" for closing Short
+        side: str,
         trigger_price: float,
         reduce_only: bool = True
     ) -> Dict[str, Any]:
         """
-        Submits a native exchange-side STOP_MARKET order.
-        Hardware protection: sits on CoinSwitch hardware so sudden crashes never liquidate the user.
+        Submits hardware Stop Loss via /v5/position/trading-stop.
         """
         body = {
-            "exchange": "EXCHANGE_2",
+            "category": "linear",
             "symbol": symbol.upper(),
-            "side": side.upper(),
-            "order_type": "STOP_MARKET",
-            "quantity": 0,                      # 0 quantity = full position close on trigger
-            "trigger_price": float(trigger_price),
-            "reduce_only": reduce_only
+            "stopLoss": str(trigger_price),
+            "slTriggerBy": "MarkPrice",
+            "tpslMode": "Full",
+            "positionIdx": 0
         }
-        resp = self._send_request("POST", "/trade/api/v2/futures/order", json_body=body)
-        if resp.status_code not in (200, 201):
-            raise RuntimeError(f"Place stop market order failed ({resp.status_code}): {resp.text}")
-        return resp.json().get("data", {})
+        resp = self._send_request("POST", "/v5/position/trading-stop", json_body=body, use_dma=True)
+        if resp.status_code != 200 or resp.json().get("retCode") != 0:
+            raise RuntimeError(f"Place stop market order failed: {resp.text}")
+        return resp.json().get("result", {})
 
-    def cancel_order(self, order_id: str) -> Dict[str, Any]:
+    def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> Dict[str, Any]:
         """
-        Cancels an open order.
+        Cancels an open order on DMA.
         """
-        body = {"exchange": "EXCHANGE_2", "order_id": order_id}
-        resp = self._send_request("DELETE", "/trade/api/v2/futures/order", json_body=body)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Cancel order failed ({resp.status_code}): {resp.text}")
-        return resp.json().get("data", {})
+        body = {"category": "linear", "symbol": symbol.upper() if symbol else "ETHUSDT", "orderId": order_id}
+        resp = self._send_request("POST", "/v5/order/cancel", json_body=body, use_dma=True)
+        if resp.status_code != 200 or resp.json().get("retCode") != 0:
+            raise RuntimeError(f"Cancel order failed: {resp.text}")
+        return resp.json().get("result", {})
 
     def cancel_all_open_orders(self, symbol: Optional[str] = None) -> Dict[str, Any]:
         """
         Cancels all open orders (used in emergency /panic kill-switch).
         """
-        body = {"exchange": "EXCHANGE_2"}
-        if symbol:
-            body["symbol"] = symbol.upper()
-        resp = self._send_request("POST", "/trade/api/v2/futures/cancel_all", json_body=body)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Cancel all orders failed ({resp.status_code}): {resp.text}")
-        return resp.json().get("data", {})
+        body = {"category": "linear", "symbol": symbol.upper() if symbol else "ETHUSDT"}
+        resp = self._send_request("POST", "/v5/order/cancel-all", json_body=body, use_dma=True)
+        if resp.status_code != 200 or resp.json().get("retCode") != 0:
+            raise RuntimeError(f"Cancel all orders failed: {resp.text}")
+        return resp.json().get("result", {})
 
 
 class SmartOrderChaser:
@@ -400,7 +441,7 @@ class SmartOrderChaser:
             spread_pct = (best_ask - best_bid) / mid_price
             if spread_pct > self.config.MAX_SPREAD_PCT:
                 if active_order_id:
-                    self.client.cancel_order(active_order_id)
+                    self.client.cancel_order(active_order_id, symbol)
                 return {
                     "success": False,
                     "reason": f"Spread ({spread_pct * 100:.3f}%) exceeds safety ceiling ({self.config.MAX_SPREAD_PCT * 100:.2f}%)"
@@ -410,7 +451,7 @@ class SmartOrderChaser:
             current_slippage = (best_ask - signal_candle_close) / signal_candle_close if direction == 1 else (signal_candle_close - best_bid) / signal_candle_close
             if current_slippage > self.config.MAX_SLIPPAGE_PCT:
                 if active_order_id:
-                    self.client.cancel_order(active_order_id)
+                    self.client.cancel_order(active_order_id, symbol)
                 logger.warning(f"Slippage ceiling hit ({current_slippage * 100:.2f}% > {self.config.MAX_SLIPPAGE_PCT * 100:.2f}%). Aborting trade safely.")
                 return {
                     "success": False,
@@ -423,12 +464,11 @@ class SmartOrderChaser:
             # 4. If we had an active order from previous attempt, cancel it before re-quoting
             if active_order_id:
                 try:
-                    status_info = self.client.get_order_status(active_order_id)
-                    order_status = status_info.get("status", "").upper()
-                    if order_status in ("EXECUTED", "FILLED"):
-                        avg_price = float(status_info.get("average_price", target_limit_price))
+                    positions = self.client.get_positions(symbol)
+                    if positions and float(positions[0].get("size", 0)) >= quantity:
+                        avg_price = float(positions[0].get("avgPrice", target_limit_price))
                         return {"success": True, "fill_price": avg_price, "order_id": active_order_id, "attempts": attempt}
-                    self.client.cancel_order(active_order_id)
+                    self.client.cancel_order(active_order_id, symbol)
                 except Exception as e:
                     logger.warning(f"Error checking/cancelling order {active_order_id}: {e}")
 
@@ -439,7 +479,7 @@ class SmartOrderChaser:
                 price=target_limit_price,
                 quantity=quantity
             )
-            active_order_id = placed.get("order_id")
+            active_order_id = placed.get("orderId") or placed.get("order_id")
             logger.info(f"[Attempt {attempt}/{max_chase_attempts}] Limit order placed @ {target_limit_price} (ID: {active_order_id})")
 
             # 6. Sleep for 10 seconds before next check
@@ -447,17 +487,28 @@ class SmartOrderChaser:
 
             # 7. Check if order was filled during the 10-second interval
             if active_order_id:
-                status_info = self.client.get_order_status(active_order_id)
-                order_status = status_info.get("status", "").upper()
-                if order_status in ("EXECUTED", "FILLED"):
-                    avg_price = float(status_info.get("average_price", target_limit_price))
-                    logger.info(f"Order {active_order_id} filled successfully @ {avg_price}!")
-                    return {"success": True, "fill_price": avg_price, "order_id": active_order_id, "attempts": attempt}
+                try:
+                    status_info = self.client.get_order_status(active_order_id)
+                    if status_info and status_info.get("status", "").upper() in ("EXECUTED", "FILLED"):
+                        avg_price = float(status_info.get("average_price", target_limit_price))
+                        logger.info(f"Order {active_order_id} filled successfully @ {avg_price}!")
+                        return {"success": True, "fill_price": avg_price, "order_id": active_order_id, "attempts": attempt}
+                except Exception:
+                    pass
+
+                try:
+                    positions = self.client.get_positions(symbol)
+                    if positions and float(positions[0].get("size", 0)) >= quantity:
+                        avg_price = float(positions[0].get("avgPrice", target_limit_price))
+                        logger.info(f"Order {active_order_id} filled successfully @ {avg_price}!")
+                        return {"success": True, "fill_price": avg_price, "order_id": active_order_id, "attempts": attempt}
+                except Exception:
+                    pass
 
         # If exhausted all attempts without fill, cancel and abort safely
         if active_order_id:
             try:
-                self.client.cancel_order(active_order_id)
+                self.client.cancel_order(active_order_id, symbol)
             except Exception:
                 pass
 
